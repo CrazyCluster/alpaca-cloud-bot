@@ -1,7 +1,8 @@
+import optuna
 import json
+import numpy as np
 import yfinance as yf
 import pandas as pd
-import numpy as np
 from datetime import datetime
 
 # -----------------------------------
@@ -15,24 +16,7 @@ TRANSACTION_COST = 0.001
 
 
 # -----------------------------------
-# Beste Parameter laden
-# -----------------------------------
-try:
-    with open("best_params.json", "r") as f:
-        params = json.load(f)
-        print("✅ Geladene Parameter aus best_params.json:", params)
-except FileNotFoundError:
-    print("⚠️ Keine best_params.json gefunden. Verwende Standardwerte.")
-    params = {
-        "SHORT_SMA": 10,
-        "LONG_SMA": 50,
-        "ATR_PERIOD": 14,
-        "RISK_PER_TRADE": 0.02
-    }
-
-
-# -----------------------------------
-# Daten laden
+# Hilfsfunktionen
 # -----------------------------------
 def load_data(symbol):
     df = yf.download(symbol, start=START_DATE, end=END_DATE, auto_adjust=False)
@@ -44,9 +28,6 @@ def load_data(symbol):
     return df
 
 
-# -----------------------------------
-# Trading-Strategie (SMA + ATR)
-# -----------------------------------
 def run_backtest(df, short_sma, long_sma, atr_period, risk_per_trade):
     df = df.copy()
     df["sma_short"] = df["close"].rolling(window=short_sma).mean()
@@ -68,7 +49,6 @@ def run_backtest(df, short_sma, long_sma, atr_period, risk_per_trade):
         latest = df.iloc[i]
         price = latest["close"]
 
-        # Kaufbedingung
         if latest["sma_short"] > latest["sma_long"] and position == 0:
             qty = max(int((balance * risk_per_trade) / latest["atr"]), 1)
             cost = qty * price * (1 + TRANSACTION_COST)
@@ -77,7 +57,6 @@ def run_backtest(df, short_sma, long_sma, atr_period, risk_per_trade):
                 position = qty
                 entry_price = price
 
-        # Verkaufsbedingung
         elif latest["sma_short"] < latest["sma_long"] and position > 0:
             revenue = position * price * (1 - TRANSACTION_COST)
             balance += revenue
@@ -87,46 +66,57 @@ def run_backtest(df, short_sma, long_sma, atr_period, risk_per_trade):
         equity_curve.append(total_value)
 
     df["equity"] = equity_curve
-    df["returns"] = df["equity"].pct_change().fillna(0)
-    total_return = (df["equity"].iloc[-1] / INITIAL_BALANCE - 1) * 100
-    max_drawdown = ((df["equity"].cummax() - df["equity"]) / df["equity"].cummax()).max() * 100
-    return total_return, max_drawdown, df["equity"].iloc[-1]
+    returns = pd.Series(df["equity"]).pct_change().dropna()
+
+    if returns.std() == 0:
+        return -999
+    sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252)
+    return sharpe_ratio
 
 
 # -----------------------------------
-# Hauptprogramm
+# Optuna Objective über alle Aktien
 # -----------------------------------
-if __name__ == "__main__":
-    results = []
+def objective(trial):
+    short_sma = trial.suggest_int("SHORT_SMA", 5, 30)
+    long_sma = trial.suggest_int("LONG_SMA", 40, 120)
+    atr_period = trial.suggest_int("ATR_PERIOD", 5, 30)
+    risk_per_trade = trial.suggest_float("RISK_PER_TRADE", 0.005, 0.05)
 
-    print("🚀 Starte Backtest für alle Aktien ...")
+    sharpe_scores = []
 
     for stock in STOCKS:
-        print(f"\n📊 {stock} wird getestet ...")
-        df = load_data(stock)
-        total_return, max_dd, end_balance = run_backtest(
-            df,
-            params["SHORT_SMA"],
-            params["LONG_SMA"],
-            params["ATR_PERIOD"],
-            params["RISK_PER_TRADE"],
-        )
-        results.append({
-            "Symbol": stock,
-            "Rendite (%)": round(total_return, 2),
-            "Max Drawdown (%)": round(max_dd, 2),
-            "Endsaldo (USD)": round(end_balance, 2)
-        })
+        try:
+            df = load_data(stock)
+            score = run_backtest(df, short_sma, long_sma, atr_period, risk_per_trade)
+            if score != -999:
+                sharpe_scores.append(score)
+        except Exception as e:
+            print(f"⚠️ Fehler bei {stock}: {e}")
 
-    print("\n📈 Zusammenfassung:\n")
-    summary_df = pd.DataFrame(results)
-    print(summary_df.to_string(index=False))
+    if not sharpe_scores:
+        return -999  # falls alles fehlschlägt
 
-    avg_return = summary_df["Rendite (%)"].mean()
-    avg_dd = summary_df["Max Drawdown (%)"].mean()
-    print("\n💡 Durchschnitt über alle Aktien:")
-    print(f"Rendite: {avg_return:.2f}% | Max. Drawdown: {avg_dd:.2f}%")
+    # Durchschnittliche Sharpe Ratio aller Aktien
+    avg_score = np.mean(sharpe_scores)
+    return avg_score
 
-    # Optional: Ergebnisse speichern
-    summary_df.to_csv("backtest_results.csv", index=False)
-    print("\n💾 Ergebnisse gespeichert in backtest_results.csv")
+
+# -----------------------------------
+# Hauptteil
+# -----------------------------------
+if __name__ == "__main__":
+    print("🚀 Starte Multi-Asset-Optimierung ...")
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=40)
+
+    best_params = study.best_params
+    print("\n🏆 Beste Parameterkombination (über alle 5 Aktien):")
+    for k, v in best_params.items():
+        print(f"{k}: {v}")
+
+    print(f"\n📈 Durchschnittliche Sharpe Ratio: {study.best_value:.4f}")
+
+    with open("best_params.json", "w") as f:
+        json.dump(best_params, f, indent=4)
+        print("\n💾 Gespeichert in best_params.json")
